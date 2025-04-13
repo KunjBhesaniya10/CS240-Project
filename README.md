@@ -1,1 +1,1 @@
-# CS240-Project
+# Fake News Detection System
