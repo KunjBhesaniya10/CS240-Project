@@ -4,71 +4,70 @@ import gc
 import torch
 import os
 import torch.nn as nn
-import torch.nn.functional as F
-from torchsummary import summary
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader, RandomSampler,Dataset
-from sklearn.metrics import classification_report
-from torch.cuda import memory_summary
-from util import torchmetrics_classification_report
-
-import torch
-from torch.utils.data import Dataset
+from sklearn.metrics import classification_report,confusion_matrix
+from util import *
+import argparse
 import numpy as np
 import torch
-import torchmetrics
-
-
 
 class CNN_BILSTM(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim) -> None:
         super(CNN_BILSTM, self).__init__()
 
-        self.conv = nn.Sequential(
-            nn.Conv1d(input_dim, 32, kernel_size=7, padding=3),
-            nn.Relu(),
-            nn.MaxPool1d(kernel_size=2, stride=2),
-            nn.Dropout(0.2),
+        def multi_kernel_conv(in_channels, out_channels):
+            return nn.ModuleList([
+                nn.Conv1d(in_channels, out_channels, kernel_size=k, padding=k//2)
+                for k in [3, 5, 7]  # multiple kernel sizes
+            ])
 
-            nn.Conv1d(32, 64, kernel_size=7, padding=3),
-            nn.Relu(),
-            nn.MaxPool1d(kernel_size=2, stride=2),
-            nn.Dropout(0.2),
+        self.conv1 = multi_kernel_conv(input_dim, 32)
+        self.conv2 = multi_kernel_conv(32 * 3, 64)
+        self.conv3 = multi_kernel_conv(64 * 3, 128)
 
-            nn.Conv1d(64, 128, kernel_size=7, padding=3),
-            nn.Relu(),
-            nn.MaxPool1d(kernel_size=2, stride=2),
-            nn.Dropout(0.2),
-        )
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(0.2)
 
         self.lstm = nn.LSTM(
-            input_size=128,
+            input_size=128 * 3,
             hidden_size=100,
             num_layers=1,
             bidirectional=True,
             batch_first=True
         )
 
-        self.pool = nn.AdaptiveMaxPool1d(1)
+        self.adaptive_pool = nn.AdaptiveMaxPool1d(1)
         self.fc1 = nn.Linear(2 * 100, 50)
         self.fc2 = nn.Linear(50, output_dim)
-        
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # x: [batch, input_dim, seq_len]
-        x = x.permute(0, 2, 1)  
-        x = self.conv(x)  # -> [batch, 128, reduced_seq_len]
-        x = x.permute(0, 2, 1)  # for LSTM: [batch, seq_len, 128]
-        x,state = self.lstm(x)   # -> [batch, seq_len, 2*hidden_dim]
-        x = x.permute(0, 2, 1)  # for pooling: [batch, 2*hidden_dim, seq_len]
-        x = self.pool(x).squeeze(-1)  # -> [batch, 2*hidden_dim]
+        x = x.permute(0, 2, 1)  # [batch, input_dim, seq_len]
+
+        x = torch.cat([self.relu(conv(x)) for conv in self.conv1], dim=1)
+        x = self.pool(x)
+        x = self.dropout(x)
+
+        x = torch.cat([self.relu(conv(x)) for conv in self.conv2], dim=1)
+        x = self.pool(x)
+        x = self.dropout(x)
+
+        x = torch.cat([self.relu(conv(x)) for conv in self.conv3], dim=1)
+        x = self.pool(x)
+        x = self.dropout(x)
+
+        x = x.permute(0, 2, 1)
+        x, state = self.lstm(x)
+        x = x.permute(0, 2, 1)
+        x = self.adaptive_pool(x).squeeze(-1)
+
         x = self.fc1(x)
         x = self.fc2(x)
         return self.sigmoid(x)
 
 
-def train_model(model,train_loader,val_loader,criterion,optimizer,device,num_epochs=25):
+def train_model(model,train_loader,val_loader,criterion,optimizer,device,num_epochs=25,batch_size=64):
     
     model = model.to(device)
     train_losses = []
@@ -82,28 +81,27 @@ def train_model(model,train_loader,val_loader,criterion,optimizer,device,num_epo
         running_loss = 0.0
         training_acc = 0.0
         start = time.time()
+        
         for inputs, labels in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
-            
             optimizer.zero_grad()
             outputs = model(inputs).squeeze()  # outputs shape: [batch]
             training_acc += ((outputs > 0.5) == labels).float().sum().item()
             loss = criterion(outputs, labels.float())  # BCE requires float labels
+            running_loss += (loss.item())
             loss.backward()
             optimizer.step()
             
             del inputs, labels, outputs
             gc.collect()
             torch.cuda.empty_cache()                   
-            running_loss += (loss.item())
-        # if epoch == 0:
-            # print(len(train_loader.dataset))
             
         training_acc /= len(train_loader.dataset)
         train_accs.append(training_acc)
-        avg_train_loss = running_loss / len(train_loader.dataset)
+        avg_train_loss = (running_loss*batch_size) / len(train_loader.dataset)
         train_losses.append(avg_train_loss)
 
+    
         # Validation loop   
         model.eval()
         val_running_loss = 0.0
@@ -117,13 +115,14 @@ def train_model(model,train_loader,val_loader,criterion,optimizer,device,num_epo
                 val_running_loss += loss.item()
                 val_acc += ((outputs > 0.5) == labels).float().sum().item()
                 val_outputs.extend((outputs > 0.5).cpu().numpy())
+               
                 del inputs, labels, outputs
                 gc.collect()
                 torch.cuda.empty_cache()
                         
         val_acc /= len(val_loader.dataset)
         val_accs.append(val_acc)
-        avg_val_loss = val_running_loss / len(val_loader.dataset)
+        avg_val_loss = val_running_loss*batch_size/ len(val_loader.dataset)
         val_losses.append(avg_val_loss)
         end = time.time()
         print(f"Epoch [{epoch+1}/{num_epochs}] "
@@ -134,84 +133,77 @@ def train_model(model,train_loader,val_loader,criterion,optimizer,device,num_epo
 
 
 if __name__ == "__main__":
-    # Example usage
-    input_dim = 150
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('--model',type=str, 
+                        default='cbow-glove',
+                        help='Model to use: cbow-glove, skipgram-glove, glove, skipgram-glove')
+    parser.add_argument('--niters', type=int, default=10, help='Number of iterations for training')
+    args = parser.parse_args()
+
+    embeds = args.model.split('-')
+    input_dict = {'cbow': 100, 'skipgram': 300, 'glove': 50}
+   
+    input_dim = 0
+    for embed in embeds:
+        if embed not in input_dict:
+            raise ValueError(f"Invalid model name: {embed}. Choose from {list(input_dict.keys())}.")
+        input_dim += input_dict[embed]
     hidden_dim = 100
     output_dim = 1
+
     model = CNN_BILSTM(input_dim, hidden_dim, output_dim)    
     g = torch.Generator()
     g.manual_seed(42)
-    # import torch
-
-    # train_files_cbow = [os.path.join('../Data/cbow', f) for f in os.listdir('../Data/cbow') if 'train' in f]
-    # train_files_skipgram = [os.path.join('../Data/skipgram', f) for f in os.listdir('../Data/skipgram') if 'train' in f]
-    # train_files_glove = [os.path.join('../Data/glove', f) for f in os.listdir('../Data/glove') if 'train' in f]
-    # # print(f"train_files_cbow: {train_files_cbow}")
-    # train_files = [train_files_cbow, train_files_skipgram, train_files_glove]
-    # # train_dataloader = CombinedFoldersDataset(*train_files,model_used='glove', batch_size=1000)
-    
-    # test_files_cbow = [os.path.join('../Data/cbow', f) for f in os.listdir('../Data/cbow') if 'test' in f]
-    # test_files_skipgram = [os.path.join('../Data/skipgram', f) for f in os.listdir('../Data/skipgram') if 'test' in f]
-    # test_files_glove = [os.path.join('../Data/glove', f) for f in os.listdir('../Data/glove') if 'test' in f]
-    # test_files = [test_files_cbow, test_files_skipgram, test_files_glove]
-    # print(test_files)
-    # test_dataloader = CombinedFoldersDataset(*test_files,model_used='glove', batch_size=1000)
-    
-    # print(f"train_dataloader length: {len(train_dataloader)}")
-    # exit()
-    # glove_0 = np.load('../Data/glove/train0.npy')
-    # glove_1 = np.load('../Data/glove/train1.npy')
-    # glove_2 = np.load('../Data/glove/train2.npy')
-    # glove_3 = np.load('../Data/glove/train3.npy')
-    # glove = np.concatenate((glove_0, glove_1, glove_2,glove_3), axis=0)
-    # print(f"glove shape: {glove.shape}")
-    # del glove_0, glove_1, glove_2, glove_3
-    # print(f"glove shape: {glove.shape}")
-    cbow = np.load('../Data/cbow/train0.npy')
-    glove = np.load('../Data/glove/train0.npy')
-    train_data = np.concatenate((cbow, glove), axis=2)
-    del cbow, glove
-    print(f"train_data shape: {train_data.shape}")
-    print("Loading data...")
-    
-    print(f"train_data shape: {train_data.shape}")
-    glove_test = np.load('../Data/glove/test0.npy')
-    cbow_test = np.load('../Data/cbow/test0.npy')
-    test_data = np.concatenate((cbow_test, glove_test), axis=2)
-    del cbow_test, glove_test
-    
-    train_dataset = TensorDataset(torch.from_numpy(train_data).float(), torch.from_numpy(np.load('../Data/train_labels.npy')).float())
-    test_dataset = TensorDataset(torch.from_numpy(test_data).float(), torch.from_numpy(np.load('../Data/test_labels.npy')).float())
-    
-    train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     num_epochs = 10
-    # Train the model
-    train_losses, val_losses,train_accs,test_accs,val_ouputs = train_model(model,train_dataloader,test_dataloader,criterion,optimizer,device,num_epochs=num_epochs)    
+
+    train_files =[[os.path.join(f"../Data/{embed}", f) for f in os.listdir(f"../Data/{embed}") if 'train' in f] for embed in embeds]
     
-    # train_losses = []
-    # val_losses = []
+    train_dataset = CombinedFoldersDataset(train_files,model_used=args.model, is_train=True)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=False)
+    
+    test_files =[[os.path.join(f"../Data/{embed}", f) for f in os.listdir(f"../Data/{embed}") if 'test' in f] for embed in embeds]    
+    test_dataset = CombinedFoldersDataset(test_files,model_used=args.model, is_train=False)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+    # Train the model
+    train_losses,val_losses,train_accs,test_accs,val_ouputs = train_model(model,
+                                                                          train_dataloader,
+                                                                          test_dataloader,
+                                                                          criterion,
+                                                                          optimizer,
+                                                                          device,
+                                                                          num_epochs=args.niters)   
+    torch.save(model.state_dict(), f"{args.model}_model.pth")
+    
+    plot_save_name = args.model
     import matplotlib.pyplot as plt
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
+    plt.title(f'Loss vs Epochs - {plot_save_name}')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
+    plt.savefig(f'loss_vs_epochs_{plot_save_name}.png')
     plt.show()
+    plt.clf()
     
     plt.plot(train_accs, label='Train Accuracy')
     plt.plot(test_accs, label='Validation Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
+    plt.title(f'Accuracy vs Epochs - {plot_save_name}')
+    plt.legend()
+    plt.savefig(f'accuracy_vs_epochs_{plot_save_name}.png')
     plt.show()
     
-    
-
-    rep = classification_report(np.load('../Data/test_labels.npy'), np.array(val_ouputs))
+    test_labels = np.load('../Data/test_labels.npy')
+    rep = classification_report(test_labels, np.array(val_ouputs),digits=4)
+    conf = confusion_matrix(test_labels, np.array(val_ouputs))
     print(rep)
+    print(conf)
 
         
         
